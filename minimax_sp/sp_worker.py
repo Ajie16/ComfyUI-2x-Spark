@@ -20,8 +20,13 @@ def main():
     ap.add_argument("--rank", type=int, required=True)
     ap.add_argument("--world", type=int, required=True)
     ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--master", default="127.0.0.1",
+                    help="Rank-0 rendezvous IP. 127.0.0.1 for single-node; fabric IP for two Sparks.")
     ap.add_argument("--unet", required=True)
     ap.add_argument("--weight-dtype", default="default")
+    ap.add_argument("--lora", default="",
+                    help="Optional LoRA filename under models/loras, applied on this rank too.")
+    ap.add_argument("--lora-strength", type=float, default=1.0)
     ap.add_argument("--comfy-root", required=True)
     a = ap.parse_args()
 
@@ -29,8 +34,11 @@ def main():
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
+    from minimax_sp.spark_cluster import apply_nccl_env
+    apply_nccl_env()
+
     # rendezvous before loading 21GB of weights so the TCP init doesn't time out
-    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{a.port}",
+    dist.init_process_group("nccl", init_method=f"tcp://{a.master}:{a.port}",
                             rank=a.rank, world_size=a.world, timeout=timedelta(minutes=40),
                             device_id=torch.device("cuda", 0))
     obj_pg = dist.new_group(backend="gloo", timeout=timedelta(minutes=40))
@@ -56,6 +64,13 @@ def main():
     stream = os.environ.get("MINIMAX_SP_STREAM") == "1"
     logging.info(f"rank {a.rank}: loading {a.unet} (stream_weights={stream})")
     patcher = comfy.sd.load_diffusion_model(path, model_options=model_options)
+    if a.lora:
+        import comfy.utils
+        lora_path = folder_paths.get_full_path_or_raise("loras", a.lora)
+        logging.info(f"rank {a.rank}: applying LoRA {a.lora} strength={a.lora_strength}")
+        lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        patcher, _ = comfy.sd.load_lora_for_models(patcher, None, lora_sd, a.lora_strength, 0)
+        del lora_sd
     comfy.model_management.load_models_gpu([patcher], force_full_load=not stream)
     dit = patcher.model.diffusion_model
     device = patcher.load_device
@@ -78,7 +93,7 @@ def main():
         tensors = {}
         if meta.get("op") == "vae_load":
             import comfy.ldm.minimax.vae
-
+            spv.enable_stack_tiling()
             vae_model = comfy.ldm.minimax.vae.MiniMaxH3VideoVAE()
             state = {}
             for name, shape, dtype in meta["manifest"]:

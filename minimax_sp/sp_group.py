@@ -24,6 +24,7 @@ import torch.distributed as dist
 
 import comfy.model_management
 
+from . import spark_cluster
 from . import sp_forward as spf
 from . import sp_vae as spv
 
@@ -101,32 +102,58 @@ def ordered_tensors(x, timestep, context, payload):
 
 
 class SPGroup:
-    def __init__(self, world, unet_name, weight_dtype, devices, port=29511):
+    def __init__(self, world, unet_name, weight_dtype, devices, port=29511,
+                 peer_host="", master_ip="", lora_name="", lora_strength=1.0):
         self.world = world
         self.unet_name = unet_name
         self.procs = []
         self.log_paths = {}
         self.n_forward = 0
         self.vae_sent = False
-        comfy_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # __file__ lives in custom_nodes/<plugin>/minimax_sp/; counting three
+        # parents lands on custom_nodes/, not ComfyUI (that was the two-Spark hang).
+        comfy_root = spark_cluster.find_comfy_root(__file__)
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sp_worker.py")
         log_dir = os.environ.get("MINIMAX_SP_LOGDIR") or tempfile.gettempdir()
+        peer_host = (peer_host or "").strip()
+        master_ip = (master_ip or "127.0.0.1").strip()
+        spark_cluster.apply_nccl_env()
+        logging.info(f"[minimax_sp] comfy_root={comfy_root} python={sys.executable}")
         for r in range(1, world):
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = devices[r]
-            env["PYTHONPATH"] = comfy_root + os.pathsep + env.get("PYTHONPATH", "")
             log_path = os.path.join(log_dir, f"minimax_sp_worker{r}.log")
             self.log_paths[r] = log_path
-            log = open(log_path, "w")
-            self.procs.append(subprocess.Popen(
-                [sys.executable, script, "--rank", str(r), "--world", str(world),
-                 "--port", str(port), "--unet", unet_name, "--weight-dtype", weight_dtype,
-                 "--comfy-root", comfy_root],
-                env=env, stdout=log, stderr=log, cwd=comfy_root))
-            logging.info(f"[minimax_sp] spawned worker rank {r} on physical GPU {devices[r]}")
+            if peer_host and peer_host.lower() not in ("", "local", "none"):
+                self.procs.append(spark_cluster.spawn_ssh_worker(
+                    peer_host=peer_host, rank=r, world=world, port=port,
+                    master_ip=master_ip, unet_name=unet_name,
+                    weight_dtype=weight_dtype, comfy_root=comfy_root,
+                    script=script, log_path=log_path,
+                    lora_name=lora_name, lora_strength=lora_strength))
+                logging.info(f"[minimax_sp] spawned worker rank {r} on {peer_host} "
+                             f"(rendezvous tcp://{master_ip}:{port})")
+            else:
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = devices[r]
+                env["PYTHONPATH"] = comfy_root + os.pathsep + env.get("PYTHONPATH", "")
+                log = open(log_path, "w")
+                self.procs.append(subprocess.Popen(
+                    [sys.executable, script, "--rank", str(r), "--world", str(world),
+                     "--port", str(port), "--master", master_ip,
+                     "--unet", unet_name, "--weight-dtype", weight_dtype,
+                     "--lora", lora_name, "--lora-strength", str(lora_strength),
+                     "--comfy-root", comfy_root],
+                    env=env, stdout=log, stderr=log, cwd=comfy_root))
+                logging.info(f"[minimax_sp] spawned worker rank {r} on physical GPU {devices[r]}")
+
+        # SSH/exec failures surface in <1s; do not sit in NCCL init for 40 min.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            self.check_alive()
+            time.sleep(0.2)
+        self.check_alive()
 
         if not dist.is_initialized():
-            dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}",
+            dist.init_process_group("nccl", init_method=f"tcp://{master_ip}:{port}",
                                     rank=0, world_size=world, timeout=timedelta(minutes=40),
                                     device_id=torch.device("cuda", 0))
         self.obj_pg = dist.new_group(backend="gloo", timeout=timedelta(minutes=40))
@@ -316,13 +343,17 @@ def active_group():
     return next(iter(_GROUPS.values()), None)
 
 
-def get_group(world, unet_name, weight_dtype, devices=None):
-    key = (world, unet_name, weight_dtype, tuple(devices) if devices else None)
+def get_group(world, unet_name, weight_dtype, devices=None, peer_host="", master_ip="", port=29511,
+              lora_name="", lora_strength=1.0):
+    key = (world, unet_name, weight_dtype, tuple(devices) if devices else None,
+           peer_host, master_ip, port, lora_name, lora_strength)
     if key not in _GROUPS:
         if _GROUPS:
             raise RuntimeError("[minimax_sp] a different SP group is already running; restart ComfyUI "
                                f"to change it (active: {list(_GROUPS)[0]})")
         if devices is None:
             raise ValueError("[minimax_sp] devices must be provided for a new SP group")
-        _GROUPS[key] = SPGroup(world, unet_name, weight_dtype, devices)
+        _GROUPS[key] = SPGroup(world, unet_name, weight_dtype, devices, port=port,
+                               peer_host=peer_host, master_ip=master_ip,
+                               lora_name=lora_name, lora_strength=lora_strength)
     return _GROUPS[key]

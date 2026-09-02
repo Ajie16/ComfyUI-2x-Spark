@@ -35,7 +35,6 @@ from comfy.ldm.minimax.model import (
     patchify_video,
     rope_rotation_table,
     time_shift_sigma,
-    time_shift_slope,
     unpack_audio,
     unpatchify_video,
 )
@@ -84,34 +83,80 @@ def use_allgather(world, hidden, inner):
     return 1 < world <= (3 * inner) // hidden
 
 
-def head_sharded_qkv(proj, world, rank):
-    """Row-slice qkv_proj down to this rank's heads, keeping fp8 storage.
+def _qkv_head_index(out_features, world, rank, device):
+    """Q/K/V concatenated; each rank keeps `inner/world` heads from every block."""
+    inner = out_features // 3
+    if inner % world:
+        raise ValueError(f"qkv inner dim {inner} is not divisible by world_size {world}")
+    span = inner // world
+    lo = rank * span
+    return torch.cat([torch.arange(lo, lo + span, device=device) + off * inner
+                      for off in range(3)])
 
-    The weight carries one per-tensor scale, so selecting rows is exact: every
-    output element remains the dot product it was on a single GPU. Cached on the
-    module so it is freed with the model.
+
+def _index_layout_params(params, idx, src_rows, dst_rows):
+    """Keep per-tensor scales; row-index per-channel scales (INT8 ConvRot is [N, 1])."""
+    updates = {"orig_shape": (dst_rows,) + tuple(params.orig_shape[1:])}
+    names = []
+    if hasattr(params, "_tensor_fields"):
+        names.extend(params._tensor_fields())
+    if hasattr(params, "scale") and "scale" not in names:
+        names.append("scale")
+    for name in names:
+        t = getattr(params, name, None)
+        if not torch.is_tensor(t) or t.numel() <= 1:
+            continue
+        if t.shape[0] == src_rows:
+            updates[name] = t[idx].contiguous()
+    return dataclasses.replace(params, **updates)
+
+
+def _slice_quantized_rows(w, idx):
+    """Select output rows of a QuantizedTensor, including matching scale rows."""
+    src_rows = int(w.shape[0])
+    qd = w._qdata[idx].contiguous()
+    params = _index_layout_params(w._params, idx, src_rows, qd.shape[0])
+    scale = getattr(params, "scale", None)
+    src_scale = getattr(w._params, "scale", None)
+    if (torch.is_tensor(src_scale) and src_scale.shape[:1] == (src_rows,)
+            and (not torch.is_tensor(scale) or scale.shape[0] != qd.shape[0])):
+        raise RuntimeError(
+            f"qkv shard left scale {tuple(getattr(scale, 'shape', ()))} "
+            f"for {qd.shape[0]} rows (was {tuple(src_scale.shape)}); "
+            "per-channel INT8/FP8 scales must follow the head split")
+    return type(w)(qd, w._layout_cls, params)
+
+
+def head_sharded_qkv(proj, world, rank):
+    """Row-slice qkv_proj down to this rank's heads, keeping quantized storage.
+
+    Per-tensor scales (FP8) are shared and stay as-is. Per-row scales (INT8
+    ConvRot / rowwise INT8, shape [N] or [N, 1]) are indexed with the same
+    Q/K/V rows; leaving them at full N makes kitchen int8_linear try
+    expand([N, 1] -> n=N/world) and crash.
+
+    Selecting rows is exact: every output element remains the same dot product
+    as on a single GPU. Cached on the module so it is freed with the model.
     """
     cached = getattr(proj, "_sp_shard", None)
     if cached is not None and cached[0] == (world, rank):
         return cached[1]
 
     w = proj.weight
-    inner = w.shape[0] // 3
-    span = inner // world
-    lo = rank * span
-    idx = torch.cat([torch.arange(lo, lo + span, device=w.device) + off * inner
-                     for off in range(3)])
+    idx = _qkv_head_index(w.shape[0], world, rank, w.device)
 
     sub = copy.copy(proj)
     sub._parameters = dict(proj._parameters)
     del sub._parameters["weight"]
     if type(w).__name__ == "QuantizedTensor":
-        qd = w._qdata[idx].contiguous()
-        params = dataclasses.replace(w._params, orig_shape=(qd.shape[0], w.shape[1]))
-        sub.weight = type(w)(qd, w._layout_cls, params)
+        sub.weight = _slice_quantized_rows(w, idx)
     else:
         sub.weight = w[idx].contiguous()
-    sub.out_features = idx.numel()
+    if getattr(proj, "bias", None) is not None:
+        sub.bias = proj.bias[idx].contiguous()
+        if "bias" in sub._parameters:
+            sub._parameters["bias"] = sub.bias
+    sub.out_features = int(idx.numel())
     proj._sp_shard = ((world, rank), sub)
     return sub
 
@@ -558,5 +603,5 @@ def sp_forward(dit, x, timestep, context, transformer_options, minimax_payload, 
     video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, dit.latents_dim, dit.patch_size)
     video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
     audio_out = unpack_audio(a)
-    slope_a = time_shift_slope(sigma_v, shift_v, shift_a).to(audio_out.dtype)
-    return [-video_out.to(video_x.dtype), (-slope_a) * audio_out.to(audio_x.dtype)]
+    # Match current MiniMaxH3Model._forward: audio clock rescale lives in forward().
+    return [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
